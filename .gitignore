@@ -1,0 +1,46 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Local Caches & User Configuration
+.cache/
+config.json
+
+# Output Downloads & Media Files
+/Unduhan Film/
+*.mp4
+*.mkv
+*.avi
+*.vtt
+*.srt
+*.part
+*.ytdl
+*.temp
+*.tmp
+
+# Binary Zip & Extracted FFmpeg
+ffmpeg-release-essentials.zip
+/src/ffmpeg/
+ffmpeg/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE & Assistant Configuration
+.vscode/
+.idea/
+*.swp
+.gemini/
+.antigravityignore
+
+# Temporary & Log Files
+*.log
+tmp/
+temp/
