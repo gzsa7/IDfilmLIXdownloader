@@ -14,6 +14,7 @@ import shutil
 import sys
 import zipfile
 import requests
+import tempfile
 import subprocess
 import m3u8_To_MP4
 import hashlib
@@ -23,6 +24,7 @@ from PIL import Image
 
 from loguru import logger
 from bs4 import BeautifulSoup
+from pathlib import Path
 from urllib.parse import unquote, urlparse, urljoin
 from vtt_to_srt.vtt_to_srt import ConvertFile
 
@@ -238,6 +240,7 @@ class IdlixHelper:
 
         self.poster = None
         self.m3u8_url = None
+        self.master_m3u8_url = None
         self.video_id = None
         self.video_slug = None
         self.embed_url = None
@@ -253,6 +256,8 @@ class IdlixHelper:
         self.download_paused = False
         self.download_output_path = None
         self.download_stream_url = None
+        self.stream_cookies = {}  # Cookies dari sesi redeem untuk autentikasi fragment
+        self.stream_referer = None  # Referer spesifik CDN stream server
         self.request = cffi_requests.Session(
             impersonate=random.choice(["chrome124", "chrome119", "chrome104"]),
             headers=self.headers,
@@ -264,6 +269,30 @@ class IdlixHelper:
 
     def get_origin(self):
         return self.BASE_WEB_URL.rstrip('/')
+
+    def reset_download_state(self):
+        """Reset all per-movie/per-download state so consecutive downloads
+        don't re-use stale URLs or metadata from a previous movie."""
+        self.poster = None
+        self.m3u8_url = None
+        self.master_m3u8_url = None
+        self.video_id = None
+        self.video_slug = None
+        self.embed_url = None
+        self.video_name = None
+        self.is_subtitle = None
+        self.subtitles_list = []
+        self.variant_playlist = None
+        self.content_type = "movie"
+        self.seasons_list = []
+        self.selected_episode = None
+        self.download_process = None
+        self.download_cancelled = False
+        self.download_paused = False
+        self.download_output_path = None
+        self.download_stream_url = None
+        self.stream_cookies = {}
+        self.stream_referer = None
 
     def set_active_domain(self, base_url: str):
         self.BASE_WEB_URL = normalize_base_url(base_url)
@@ -674,6 +703,19 @@ class IdlixHelper:
             self.embed_url = redeem_data.get("url")
             self.subtitles_list = redeem_data.get("subtitles", [])
 
+            # Simpan cookies dari sesi redeem – dibutuhkan yt-dlp untuk autentikasi fragment CDN
+            try:
+                self.stream_cookies = dict(redeem_sess.cookies)
+            except Exception:
+                self.stream_cookies = {}
+
+            # Tentukan Referer CDN yang benar dari embed_url (bukan BASE_WEB_URL)
+            try:
+                parsed_embed = urlparse(self.embed_url)
+                self.stream_referer = f"{parsed_embed.scheme}://{parsed_embed.netloc}/"
+            except Exception:
+                self.stream_referer = self.BASE_WEB_URL
+
             return {
                 'status': True,
                 'embed_url': self.embed_url
@@ -705,6 +747,10 @@ class IdlixHelper:
 
             if request.status_code == 200:
                 text = request.text
+                self.master_m3u8_url = self.ensure_absolute_url(
+                    getattr(request, "url", None) or self.embed_url,
+                    base_url=self.embed_url,
+                )
                 tmp_variant_playlist = []
                 id_cnt = 0
 
@@ -721,7 +767,9 @@ class IdlixHelper:
                             j += 1
                         if j < len(lines):
                             uri = lines[j].strip()
-                            uri = self.ensure_absolute_url(uri, base_url=self.embed_url)
+                            uri = self.ensure_absolute_url(
+                                uri, base_url=self.master_m3u8_url
+                            )
                             tmp_variant_playlist.append({
                                 'bandwidth': bw,
                                 'resolution': res,
@@ -731,6 +779,7 @@ class IdlixHelper:
                             id_cnt += 1
 
                 is_variant_playlist = True if len(tmp_variant_playlist) > 1 else False
+                self.variant_playlist = tmp_variant_playlist
                 if tmp_variant_playlist:
                     self.m3u8_url = tmp_variant_playlist[0]["uri"]
                 else:
@@ -784,63 +833,195 @@ class IdlixHelper:
 
         return abs_url
 
-    def download_with_ytdlp(self, stream_url=None, output_filename=None, progress_callback=None):
+    # ------------------------------------------------------------------
+    # HLS MANIFEST PATCHER & FFMPEG DOWNLOADER
+    # ------------------------------------------------------------------
+
+    def _find_ffmpeg_binary(self):
         """
-        Download encrypted M3U8 video using yt-dlp via subprocess.
-        Provides real-time log updates and callback progress support.
-        Supports Pause, Resume, and Cancel (with partial file cleanup).
+        Locate the ffmpeg binary: first checks PATH, then the local
+        src/ffmpeg directory that may have been auto-extracted.
+        Returns absolute path string or None.
         """
-        raw_url = stream_url or self.download_stream_url or self.m3u8_url or self.embed_url
-        if not raw_url:
-            return {
-                'status': False,
-                'message': 'No stream URL available to download'
+        ffmpeg = shutil.which('ffmpeg')
+        if ffmpeg:
+            return ffmpeg
+
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        local_dir = os.path.join(base_dir, 'src', 'ffmpeg')
+        if os.path.exists(local_dir):
+            for root, _dirs, files in os.walk(local_dir):
+                for f in files:
+                    if f.lower() == 'ffmpeg.exe':
+                        candidate = os.path.join(root, f)
+                        if os.path.exists(candidate):
+                            return candidate
+        return None
+
+    def _fetch_and_patch_manifest(self, m3u8_url, temp_files=None, depth=0, sess=None):
+        """
+        Deep HLS Patcher dengan mekanisme Retry dan Connection Pooling.
+        Mencegah timeout (curl 28) saat server CDN merespons lambat.
+        """
+        if temp_files is None:
+            temp_files = []
+            
+        try:
+            import time
+            parsed = urlparse(m3u8_url)
+            base_query = parsed.query
+
+            if not self.stream_referer and self.embed_url:
+                try:
+                    parsed_embed = urlparse(self.embed_url)
+                    self.stream_referer = f"{parsed_embed.scheme}://{parsed_embed.netloc}/"
+                except Exception:
+                    pass
+
+            stream_referer = self.stream_referer or self.BASE_WEB_URL
+            user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+            fetch_headers = {
+                "User-Agent": user_agent,
+                "Referer": stream_referer,
+                "Origin": stream_referer.rstrip('/'),
+                "Accept": "*/*"
             }
+            if self.stream_cookies:
+                cookie_str = '; '.join(f'{k}={v}' for k, v in self.stream_cookies.items())
+                fetch_headers["Cookie"] = cookie_str
 
-        self.download_stream_url = raw_url
-        self.download_cancelled = False
-        self.download_paused = False
+            # Gunakan session yang sama untuk mempercepat koneksi rekursif
+            if sess is None:
+                sess = cffi_requests.Session(impersonate="chrome124")
 
-        url_to_download = self.ensure_absolute_url(raw_url, base_url=self.embed_url)
-        if not (url_to_download.startswith("http://") or url_to_download.startswith("https://")):
-            logger.error(f"Invalid stream URL for yt-dlp: '{url_to_download}'")
-            return {
-                'status': False,
-                'message': f"Invalid stream URL for yt-dlp: '{url_to_download}' (must be absolute HTTP/HTTPS URL)"
-            }
+            # Sistem Retry: Coba hingga 3 kali jika terjadi Timeout
+            resp = None
+            last_err = None
+            for attempt in range(3):
+                try:
+                    resp = sess.get(m3u8_url, headers=fetch_headers, timeout=30)
+                    if resp.status_code == 200:
+                        break
+                except Exception as e:
+                    last_err = e
+                    logger.info(f"Timeout mengambil playlist (Attempt {attempt+1}/3). Mencoba lagi...")
+                    time.sleep(2)
+            
+            if not resp or resp.status_code != 200:
+                logger.warning(f"Gagal memuat manifest setelah 3 percobaan: {last_err or resp.status_code}")
+                return None
 
-        # Ensure target download directory exists
-        download_dir = "Unduhan Film/Series"
-        os.makedirs(download_dir, exist_ok=True)
+            lines = resp.text.splitlines()
+            patched = []
+            is_master = any(line.startswith("#EXT-X-STREAM-INF") for line in lines)
 
-        safe_title = "".join([c for c in (self.video_name or "video") if c.isalnum() or c in (' ', '_', '-')]).rstrip().replace(" ", "_")
-        if not output_filename:
-            output_filename = f"{safe_title}.mp4"
-        elif not output_filename.endswith(".mp4"):
-            output_filename = f"{output_filename}.mp4"
+            def _patch_uri_attr(tag_line):
+                def _replace(m):
+                    inner = m.group(1)
+                    abs_uri = self.ensure_absolute_url(inner, base_url=m3u8_url)
+                    if base_query and 't=' in base_query and 't=' not in abs_uri:
+                        delimiter = '&' if '?' in abs_uri else '?'
+                        abs_uri = f"{abs_uri}{delimiter}{base_query}"
+                    
+                    if is_master and depth == 0:
+                        sub_file = self._fetch_and_patch_manifest(abs_uri, temp_files, depth=1, sess=sess)
+                        if sub_file:
+                            abs_uri = Path(sub_file).as_uri()
+                    return f'URI="{abs_uri}"'
+                return re.sub(r'URI="([^"]*)"', _replace, tag_line)
 
-        base_name = os.path.basename(output_filename)
-        output_path = os.path.abspath(os.path.join(download_dir, base_name))
-        self.download_output_path = output_path
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    patched.append(line)
+                    continue
 
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+                if stripped.startswith('#'):
+                    if 'URI="' in stripped:
+                        patched.append(_patch_uri_attr(line))
+                    else:
+                        patched.append(line)
+                else:
+                    abs_uri = self.ensure_absolute_url(stripped, base_url=m3u8_url)
+                    if base_query and 't=' in base_query and 't=' not in abs_uri:
+                        delimiter = '&' if '?' in abs_uri else '?'
+                        abs_uri = f"{abs_uri}{delimiter}{base_query}"
+                    
+                    if is_master and depth == 0:
+                        sub_file = self._fetch_and_patch_manifest(abs_uri, temp_files, depth=1, sess=sess)
+                        if sub_file:
+                            patched.append(Path(sub_file).as_uri())
+                        else:
+                            patched.append(abs_uri)
+                    else:
+                        patched.append(abs_uri)
 
-        cmd = [
-            sys.executable, "-m", "yt_dlp",
-            "--referer", self.BASE_WEB_URL,
-            "--user-agent", user_agent,
-            "--add-header", f"Referer: {self.BASE_WEB_URL}",
-            "--add-header", f"User-Agent: {user_agent}",
-            "--add-header", f"Origin: {self.BASE_WEB_URL.rstrip('/')}",
-            "--no-check-certificates",
-            "--concurrent-fragments", "5",
-            "--newline",
-            "-o", output_path,
-            url_to_download
-        ]
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.m3u8', delete=False, encoding='utf-8')
+            tmp.write('\n'.join(patched))
+            tmp.close()
+            temp_files.append(tmp.name)
+            logger.info(f"Patched HLS manifest (Depth {depth}): {tmp.name}")
+            return tmp.name
 
-        logger.info(f"Starting yt-dlp download for: {self.video_name or safe_title} ({url_to_download})")
+        except Exception as exc:
+            logger.warning(f"Manifest patch error: {exc}")
+            return None
 
+            lines = resp.text.splitlines()
+            patched = []
+
+            def _patch_uri_attr(tag_line):
+                """
+                Rewrite URI="..." attribute(s) inside HLS tag lines
+                (e.g. #EXT-X-MAP, #EXT-X-KEY, #EXT-X-MEDIA) to absolute
+                URLs with the auth token appended.
+                """
+                def _replace(m):
+                    inner = m.group(1)
+                    abs_uri = self.ensure_absolute_url(inner, base_url=m3u8_url)
+                    if base_query and 't=' in base_query and 't=' not in abs_uri:
+                        delimiter = '&' if '?' in abs_uri else '?'
+                        abs_uri = f"{abs_uri}{delimiter}{base_query}"
+                    return f'URI="{abs_uri}"'
+                return re.sub(r'URI="([^"]*)"', _replace, tag_line)
+
+            for line in lines:
+                stripped = line.strip()
+                # Plain segment URI lines: non-empty, don't start with '#'
+                if stripped and not stripped.startswith('#'):
+                    abs_uri = self.ensure_absolute_url(stripped, base_url=m3u8_url)
+                    # Append auth token if not already present
+                    if base_query and 't=' in base_query and 't=' not in abs_uri:
+                        delimiter = '&' if '?' in abs_uri else '?'
+                        abs_uri = f"{abs_uri}{delimiter}{base_query}"
+                    patched.append(abs_uri)
+                elif stripped.startswith('#') and 'URI="' in stripped:
+                    # HLS tag lines that carry a URI attribute (#EXT-X-MAP, #EXT-X-KEY, etc.)
+                    patched.append(_patch_uri_attr(line))
+                else:
+                    patched.append(line)
+
+            # Write patched manifest to a temp file
+            tmp = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.m3u8', delete=False, encoding='utf-8'
+            )
+            tmp.write('\n'.join(patched))
+            tmp.close()
+            logger.info(f"Patched HLS manifest written to temp file: {tmp.name}")
+            return tmp.name
+
+        except Exception as exc:
+            logger.warning(f"_fetch_and_patch_manifest failed: {exc}")
+            return None
+
+    def _run_download_process(self, cmd, output_path, progress_callback):
+        """
+        Shared helper: run *cmd* as a subprocess, stream its stdout to the
+        logger and *progress_callback*, and handle cancel / pause signals.
+        Returns a result dict with ``status``, ``message``, and optionally
+        ``path``.
+        """
         try:
             process = subprocess.Popen(
                 cmd,
@@ -848,14 +1029,13 @@ class IdlixHelper:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
             )
             self.download_process = process
 
             for line in iter(process.stdout.readline, ''):
                 if self.download_cancelled or self.download_paused:
                     break
-
                 line_clean = line.strip()
                 if line_clean:
                     logger.info(line_clean)
@@ -872,41 +1052,302 @@ class IdlixHelper:
             if self.download_cancelled:
                 self.cleanup_partial_files(output_path)
                 logger.info("Download cancelled and temporary files cleaned up.")
-                return {
-                    'status': False,
-                    'message': 'Download cancelled'
-                }
-            elif self.download_paused:
+                return {'status': False, 'message': 'Download cancelled'}
+
+            if self.download_paused:
                 logger.info("Download paused.")
-                return {
-                    'status': False,
-                    'message': 'Download paused'
-                }
+                return {'status': False, 'message': 'Download paused'}
 
             if return_code == 0:
-                logger.success(f"yt-dlp download completed: {output_path}")
-                return {
-                    'status': True,
-                    'message': 'Download success',
-                    'path': output_path
-                }
-            else:
-                logger.error(f"yt-dlp failed with exit code: {return_code}")
-                return {
-                    'status': False,
-                    'message': f"yt-dlp process returned code {return_code}"
-                }
-        except Exception as error_ytdlp:
+                logger.success(f"Download completed: {output_path}")
+                return {'status': True, 'message': 'Download success', 'path': output_path}
+
+            logger.error(f"Downloader process failed with exit code: {return_code}")
+            return {'status': False, 'message': f'Process returned code {return_code}'}
+
+        except Exception as exc:
             self.download_process = None
-            logger.error(f"yt-dlp exception: {error_ytdlp}")
+            logger.error(f"Download process exception: {exc}")
+            return {'status': False, 'message': str(exc)}
+
+    def download_with_ytdlp(self, stream_url=None, output_filename=None, progress_callback=None):
+        """
+        Download an HLS/M3U8 stream with yt-dlp, retaining separate audio
+        renditions from the master playlist when available.
+
+        Strategy:
+        1. Pre-fetch the HLS manifest and rewrite every segment URI to an
+           absolute URL containing the CDN auth token (``?t=…``).  This
+           prevents HTTP 401 errors caused by yt-dlp/ffmpeg dropping the
+           ``?t=`` query-string when resolving relative segment URIs.
+        2. Download via **yt-dlp** (rather than invoking ffmpeg directly) so that
+           segment URLs with non-standard extensions (e.g. ``.js``,
+           ``.webp``) are handled transparently.  ffmpeg rejects these with
+           "detected format … mismatches allowed extensions in url".
+        3. Use the master playlist for downloads so yt-dlp can discover and
+           mux any separate audio rendition, while honoring the selected height.
+           Fall back to the original URL if manifest patching failed.
+        """
+        raw_url = stream_url or self.download_stream_url or self.m3u8_url or self.embed_url
+        if not raw_url:
+            return {'status': False, 'message': 'No stream URL available to download'}
+
+        selected_variant = next(
+            (
+                variant for variant in (self.variant_playlist or [])
+                if variant.get('uri') == self.m3u8_url
+            ),
+            None,
+        )
+        if (
+            selected_variant
+            and self.master_m3u8_url
+            and raw_url in (self.m3u8_url, self.master_m3u8_url)
+        ):
+            raw_url = self.master_m3u8_url
+        else:
+            selected_variant = None
+
+        self.download_stream_url = raw_url
+        self.download_cancelled = False
+        self.download_paused = False
+
+        url_to_download = self.ensure_absolute_url(raw_url, base_url=self.embed_url)
+        if not (url_to_download.startswith('http://') or url_to_download.startswith('https://')):
+            logger.error(f"Invalid stream URL: '{url_to_download}'")
             return {
                 'status': False,
-                'message': str(error_ytdlp)
+                'message': f"Invalid stream URL: '{url_to_download}' (must be absolute HTTP/HTTPS URL)",
             }
+
+        # ── Output path ───────────────────────────────────────────────
+        # ---> Mulai dari deklarasi variabel download_dir dan user_agent:
+        # ── Output path ───────────────────────────────────────────────
+        download_dir = 'Unduhan Film/Series'
+        os.makedirs(download_dir, exist_ok=True)
+
+        safe_title = (
+            ''.join(c for c in (self.video_name or 'video') if c.isalnum() or c in (' ', '_', '-'))
+            .rstrip()
+            .replace(' ', '_')
+        )
+        if not output_filename:
+            output_filename = f"{safe_title}.mp4"
+        elif not output_filename.endswith('.mp4'):
+            output_filename = f"{output_filename}.mp4"
+
+        base_name = os.path.basename(output_filename)
+        output_path = os.path.abspath(os.path.join(download_dir, base_name))
+        self.download_output_path = output_path
+
+        user_agent = (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/124.0.0.0 Safari/537.36'
+        )
+
+        if not self.stream_referer and self.embed_url:
+            try:
+                self.stream_referer = f"{urlparse(self.embed_url).scheme}://{urlparse(self.embed_url).netloc}/"
+            except Exception:
+                pass
+
+        stream_referer = self.stream_referer or self.BASE_WEB_URL
+        stream_origin  = stream_referer.rstrip('/')
+
+        # ── Patch manifest (Mendukung Deep Patching) ────────────────
+        temp_manifests = []
+        patched_manifest_path = self._fetch_and_patch_manifest(url_to_download, temp_manifests)
+
+        if patched_manifest_path:
+            target_input = Path(patched_manifest_path).as_uri()
+        else:
+            target_input = url_to_download
+
+        logger.info(f"Starting yt-dlp download for: {self.video_name or safe_title}")
+
+        cmd = [
+            sys.executable, '-m', 'yt_dlp',
+            '--enable-file-urls',
+            '--format', 'bestvideo+bestaudio/best',
+            '--merge-output-format', 'mp4',
+            '--referer', stream_referer,
+            '--user-agent', user_agent,
+            '--add-header', f'Referer: {stream_referer}',
+            '--add-header', f'User-Agent: {user_agent}',
+            '--add-header', f'Origin: {stream_origin}',
+            '--add-header', 'Accept: */*',
+            '--no-check-certificates',
+            
+            # GANTI MENJADI 1 AGAR TIDAK DIBLOKIR ANTI-LEECH
+            '--concurrent-fragments', '1', 
+            
+            '--retries', '10',
+            '--fragment-retries', '10',
+            '--hls-use-mpegts',
+            '--newline',
+        ]
+
+        ffmpeg_path = self._find_ffmpeg_binary()
+        if ffmpeg_path:
+            cmd.extend(['--ffmpeg-location', os.path.dirname(ffmpeg_path)])
+
+        cmd.extend(['-o', output_path, target_input])
+
+        if self.stream_cookies:
+            cookie_str = '; '.join(f'{k}={v}' for k, v in self.stream_cookies.items())
+            cmd.extend(['--add-header', f'Cookie: {cookie_str}'])
+
+        try:
+            return self._run_download_process(cmd, output_path, progress_callback)
+        finally:
+            # Pastikan semua temporary file (Master & Variants) terhapus bersih
+            for tmp_file in temp_manifests:
+                try:
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
+                except Exception:
+                    pass
 
     def download_m3u8(self, progress_callback=None):
         return self.download_with_ytdlp(progress_callback=progress_callback)
 
+    def get_available_subtitles(self):
+        """
+        Return the list of available subtitles with lang code and label.
+        Each entry: {'lang': 'id', 'label': 'Indonesian', 'path': 'https://...'}
+        """
+        if not self.subtitles_list:
+            return []
+
+        LANG_NAMES = {
+            'id': 'Indonesian', 'en': 'English', 'es': 'Spanish',
+            'fr': 'French', 'de': 'German', 'pt': 'Portuguese',
+            'it': 'Italian', 'nl': 'Dutch', 'ja': 'Japanese',
+            'ko': 'Korean', 'zh': 'Chinese', 'ar': 'Arabic',
+            'hi': 'Hindi', 'th': 'Thai', 'vi': 'Vietnamese',
+            'ms': 'Malay', 'tr': 'Turkish', 'ru': 'Russian',
+            'pl': 'Polish', 'sv': 'Swedish', 'da': 'Danish',
+            'no': 'Norwegian', 'fi': 'Finnish', 'el': 'Greek',
+            'cs': 'Czech', 'ro': 'Romanian', 'hu': 'Hungarian',
+            'uk': 'Ukrainian', 'hr': 'Croatian', 'bg': 'Bulgarian',
+        }
+        result = []
+        for sub in self.subtitles_list:
+            lang = sub.get('lang', 'unknown')
+            label = sub.get('label') or LANG_NAMES.get(lang, lang.upper())
+            result.append({
+                'lang': lang,
+                'label': label,
+                'path': sub.get('path', ''),
+            })
+        return result
+
+    def download_subtitles_for_video(self, selected_langs=None, output_dir=None):
+        """
+        Download subtitle files for the current video.
+
+        Args:
+            selected_langs: List of language codes to download (e.g. ['id', 'en']).
+                            If None or empty, downloads all available subtitles.
+            output_dir: Directory to save subtitle files. Defaults to 'Unduhan Film/Series'.
+
+        Returns:
+            dict with 'status', 'downloaded' (list of saved paths), 'message'.
+        """
+        try:
+            if not self.subtitles_list:
+                return {
+                    'status': False,
+                    'message': 'Tidak ada subtitle yang tersedia untuk video ini',
+                    'downloaded': []
+                }
+
+            download_dir = output_dir or 'Unduhan Film/Series'
+            os.makedirs(download_dir, exist_ok=True)
+
+            safe_name = (
+                ''.join(c for c in (self.video_name or 'video') if c.isalnum() or c in (' ', '_', '-'))
+                .rstrip()
+                .replace(' ', '_')
+            )
+
+            downloaded_files = []
+            errors = []
+
+            for sub in self.subtitles_list:
+                lang = sub.get('lang', 'unknown')
+
+                # Filter by selected languages if specified
+                if selected_langs and lang not in selected_langs:
+                    continue
+
+                sub_url = sub.get('path', '')
+                if not sub_url:
+                    errors.append(f"Subtitle URL kosong untuk bahasa: {lang}")
+                    continue
+
+                try:
+                    logger.info(f"Downloading subtitle [{lang}]: {sub_url}")
+                    subtitle_request = requests.get(url=sub_url, timeout=15)
+
+                    if subtitle_request.status_code != 200:
+                        errors.append(f"Gagal download subtitle [{lang}]: HTTP {subtitle_request.status_code}")
+                        continue
+
+                    # Save VTT file with language code
+                    vtt_filename = os.path.join(download_dir, f"{safe_name}.{lang}.vtt")
+                    with open(vtt_filename, 'wb') as f:
+                        f.write(subtitle_request.content)
+
+                    # Convert VTT to SRT
+                    self.convert_vtt_to_srt(vtt_filename)
+                    srt_filename = os.path.join(download_dir, f"{safe_name}.{lang}.srt")
+
+                    if os.path.exists(srt_filename):
+                        downloaded_files.append(srt_filename)
+                        logger.success(f"Subtitle [{lang}] saved: {os.path.basename(srt_filename)}")
+                    else:
+                        # SRT conversion might save without lang code; try old pattern
+                        alt_srt = os.path.join(download_dir, f"{safe_name}.srt")
+                        if os.path.exists(alt_srt):
+                            # Rename to include language code
+                            os.rename(alt_srt, srt_filename)
+                            downloaded_files.append(srt_filename)
+                            logger.success(f"Subtitle [{lang}] saved: {os.path.basename(srt_filename)}")
+                        else:
+                            # Keep VTT as fallback
+                            downloaded_files.append(vtt_filename)
+                            logger.warning(f"Subtitle [{lang}] saved as VTT (SRT conversion skipped): {os.path.basename(vtt_filename)}")
+
+                except Exception as sub_err:
+                    errors.append(f"Error downloading subtitle [{lang}]: {str(sub_err)}")
+                    logger.warning(f"Error downloading subtitle [{lang}]: {sub_err}")
+
+            if downloaded_files:
+                self.is_subtitle = True
+                msg = f"Berhasil download {len(downloaded_files)} subtitle"
+                if errors:
+                    msg += f" ({len(errors)} gagal)"
+                return {
+                    'status': True,
+                    'message': msg,
+                    'downloaded': downloaded_files,
+                }
+            else:
+                return {
+                    'status': False,
+                    'message': 'Gagal download semua subtitle' + (f': {"; ".join(errors)}' if errors else ''),
+                    'downloaded': [],
+                }
+
+        except Exception as e:
+            logger.error(f"Error in download_subtitles_for_video: {e}")
+            return {
+                'status': False,
+                'message': str(e),
+                'downloaded': [],
+            }
 
     def get_subtitle(self, download=True):
         try:
@@ -1134,5 +1575,3 @@ class IdlixHelper:
 
     def set_m3u8_url(self, m3u8_url):
         self.m3u8_url = self.ensure_absolute_url(m3u8_url, base_url=self.embed_url)
-
-

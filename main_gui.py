@@ -114,6 +114,13 @@ def draw_cancel_icon(canvas, color=Colors.TEXT_PRIMARY):
 
 
 
+def draw_subtitle_icon(canvas, color=Colors.TEXT_PRIMARY):
+    canvas.delete("all")
+    # Text bubble / CC icon
+    canvas.create_rectangle(2, 4, 14, 13, outline=color, width=1.5)
+    canvas.create_text(8, 8.5, text="CC", fill=color, font=("Consolas", 6, "bold"))
+
+
 def draw_download_icon(canvas, color=Colors.TEXT_PRIMARY):
     canvas.delete("all")
     canvas.create_line(8, 2, 8, 10, fill=color, width=1.5)
@@ -1103,6 +1110,153 @@ class IdlixGUI:
         return result["res"]
 
     # ────────────────────────────────────────────
+    # SUBTITLE LANGUAGE SELECTOR MODAL (FOR DOWNLOAD)
+    # ────────────────────────────────────────────
+    def ask_subtitle_languages(self, available_subs):
+        """
+        Show a modal dialog for the user to select subtitle languages to download.
+        Returns a list of selected language codes, or None if skipped/cancelled.
+        """
+        if not available_subs:
+            return None
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Download Subtitle")
+        popup.configure(bg=Colors.BG_SURFACE)
+        popup.geometry("380x480")
+        popup.resizable(False, False)
+        popup.transient(self.root)
+
+        popup.update_idletasks()
+        px = self.root.winfo_x() + (self.root.winfo_width()  - 380) // 2
+        py = self.root.winfo_y() + (self.root.winfo_height() - 480) // 2
+        popup.geometry(f"+{max(0, px)}+{max(0, py)}")
+
+        content = tk.Frame(popup, bg=Colors.BG_SURFACE)
+        content.pack(fill="both", expand=True, padx=24, pady=20)
+
+        # Title with subtitle icon
+        title_frame = tk.Frame(content, bg=Colors.BG_SURFACE)
+        title_frame.pack(pady=(0, 4))
+
+        icon_canvas = tk.Canvas(
+            title_frame, width=20, height=20,
+            bg=Colors.BG_SURFACE, highlightthickness=0
+        )
+        icon_canvas.pack(side="left", padx=(0, 8))
+        draw_subtitle_icon(icon_canvas, Colors.ACCENT)
+
+        tk.Label(
+            title_frame, text="Download Subtitle", font=Fonts.MODAL_TITLE,
+            bg=Colors.BG_SURFACE, fg=Colors.TEXT_PRIMARY
+        ).pack(side="left")
+
+        tk.Label(
+            content, text="Pilih bahasa subtitle yang ingin didownload:",
+            font=Fonts.CARD_META, bg=Colors.BG_SURFACE, fg=Colors.TEXT_SECONDARY
+        ).pack(pady=(0, 12))
+
+        # Subtitle list with checkboxes
+        check_frame = tk.Frame(content, bg=Colors.BG_ELEVATED)
+        check_frame.pack(fill="both", expand=True, pady=(0, 12))
+
+        # Scrollable area for checkboxes
+        sub_canvas = tk.Canvas(
+            check_frame, bg=Colors.BG_ELEVATED, highlightthickness=0
+        )
+        sub_scrollbar = tk.Scrollbar(
+            check_frame, orient="vertical", command=sub_canvas.yview
+        )
+        sub_canvas.configure(yscrollcommand=sub_scrollbar.set)
+        sub_scrollbar.pack(side="right", fill="y")
+        sub_canvas.pack(side="left", fill="both", expand=True)
+
+        inner_frame = tk.Frame(sub_canvas, bg=Colors.BG_ELEVATED)
+        sub_canvas.create_window((0, 0), window=inner_frame, anchor="nw")
+
+        checkbox_vars = {}
+        for sub in available_subs:
+            lang = sub['lang']
+            label = sub['label']
+            var = tk.BooleanVar(value=(lang in ('id', 'en')))  # Pre-select ID and EN
+            checkbox_vars[lang] = var
+
+            cb_row = tk.Frame(inner_frame, bg=Colors.BG_ELEVATED)
+            cb_row.pack(fill="x", padx=12, pady=4)
+
+            cb = tk.Checkbutton(
+                cb_row, text=f"  {label}  ({lang})",
+                variable=var, font=Fonts.BUTTON,
+                bg=Colors.BG_ELEVATED, fg=Colors.TEXT_PRIMARY,
+                selectcolor=Colors.BG_INPUT,
+                activebackground=Colors.BG_ELEVATED,
+                activeforeground=Colors.TEXT_PRIMARY,
+                highlightthickness=0, borderwidth=0,
+                cursor="hand2"
+            )
+            cb.pack(side="left", anchor="w")
+
+        inner_frame.update_idletasks()
+        sub_canvas.configure(scrollregion=sub_canvas.bbox("all"))
+
+        # Select All / Deselect All buttons
+        sel_row = tk.Frame(content, bg=Colors.BG_SURFACE)
+        sel_row.pack(fill="x", pady=(0, 8))
+
+        def select_all():
+            for v in checkbox_vars.values():
+                v.set(True)
+
+        def deselect_all():
+            for v in checkbox_vars.values():
+                v.set(False)
+
+        IconButton(
+            sel_row, text="Pilih Semua", command=select_all,
+            bg=Colors.BTN_SECONDARY, hover_bg=Colors.BTN_SECONDARY_HOVER
+        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        IconButton(
+            sel_row, text="Hapus Semua", command=deselect_all,
+            bg=Colors.BTN_SECONDARY, hover_bg=Colors.BTN_SECONDARY_HOVER
+        ).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        result = {"langs": None}
+
+        def download_selected():
+            selected = [lang for lang, var in checkbox_vars.items() if var.get()]
+            result["langs"] = selected if selected else None
+            popup.destroy()
+
+        def skip():
+            result["langs"] = []
+            popup.destroy()
+
+        # Download button
+        IconButton(
+            content, draw_download_icon, "Download Subtitle",
+            command=download_selected,
+            bg=Colors.ACCENT, hover_bg=Colors.ACCENT_HOVER,
+            fg="#FFFFFF", icon_color="#FFFFFF"
+        ).pack(fill="x", pady=(4, 4))
+
+        # Skip link
+        skip_lbl = tk.Label(
+            content, text="Lewati (tanpa subtitle)", font=Fonts.BUTTON,
+            bg=Colors.BG_SURFACE, fg=Colors.TEXT_MUTED, cursor="hand2"
+        )
+        skip_lbl.pack(pady=(4, 0))
+        skip_lbl.bind("<Button-1>", lambda e: skip())
+        skip_lbl.bind("<Enter>", lambda e: skip_lbl.configure(fg=Colors.TEXT_PRIMARY))
+        skip_lbl.bind("<Leave>", lambda e: skip_lbl.configure(fg=Colors.TEXT_MUTED))
+
+        popup.protocol("WM_DELETE_WINDOW", skip)
+
+        popup.grab_set()
+        self.root.wait_window(popup)
+        return result["langs"]
+
+    # ────────────────────────────────────────────
     # SEASON & EPISODE SELECTOR MODAL (FOR TV SERIES)
     # ────────────────────────────────────────────
     def ask_season_and_episode(self, series_title, seasons_list, series_slug):
@@ -1291,6 +1445,10 @@ class IdlixGUI:
         def task():
             idlix = self.idlix
 
+            # Reset all per-movie state so stale URLs from a previous
+            # download/play session are never accidentally re-used.
+            idlix.reset_download_state()
+
             # 1. get video data
             video_data = retry(idlix.get_video_data, url)
             if not video_data.get("status"):
@@ -1391,6 +1549,21 @@ class IdlixGUI:
 
             # DOWNLOAD
             else:
+                # ── Ask user which subtitles to download BEFORE video download ──
+                # (We already have subtitles_list from get_embed_url)
+                available_subs = idlix.get_available_subtitles()
+                selected_sub_langs = [None]
+
+                if available_subs:
+                    def ask_subs():
+                        selected_sub_langs[0] = self.ask_subtitle_languages(available_subs)
+                    self.root.after(0, ask_subs)
+                    # Wait for modal to close
+                    while selected_sub_langs[0] is None:
+                        time.sleep(0.1)
+                else:
+                    selected_sub_langs[0] = []  # No subs available, skip
+
                 self.root.after(
                     0, lambda: self._show_status_bar("Downloading via yt-dlp...", show_dl_controls=True, is_paused=False)
                 )
@@ -1417,16 +1590,50 @@ class IdlixGUI:
                     )
                 elif result.get("status"):
                     logger.success(f"Downloaded successfully: {result['path']}")
-                    self.root.after(
-                        0,
-                        lambda: self._show_status_bar("Download completed.", show_dl_controls=False)
-                    )
+
+                    # ── Download subtitles after video download succeeds ──
+                    chosen_langs = selected_sub_langs[0]
+                    if chosen_langs:  # User selected subtitle languages
+                        self.root.after(
+                            0, lambda: self._show_status_bar("Downloading subtitle...", show_dl_controls=False)
+                        )
+                        sub_result = idlix.download_subtitles_for_video(
+                            selected_langs=chosen_langs
+                        )
+                        if sub_result.get("status"):
+                            sub_count = len(sub_result.get('downloaded', []))
+                            logger.success(f"Subtitle downloaded: {sub_result['message']}")
+                            self.root.after(
+                                0,
+                                lambda c=sub_count: self._show_status_bar(
+                                    f"Download completed + {c} subtitle berhasil disimpan.",
+                                    show_dl_controls=False
+                                )
+                            )
+                        else:
+                            logger.warning(f"Subtitle download failed: {sub_result.get('message')}")
+                            self.root.after(
+                                0,
+                                lambda: self._show_status_bar(
+                                    "Download video selesai, tapi subtitle gagal.",
+                                    show_dl_controls=False
+                                )
+                            )
+                    else:
+                        self.root.after(
+                            0,
+                            lambda: self._show_status_bar("Download completed.", show_dl_controls=False)
+                        )
                 else:
                     logger.error(f"Download failed: {result.get('message')}")
                     self.root.after(
                         0,
                         lambda: self._show_status_bar("Download failed.", show_dl_controls=False)
                     )
+
+                # Clean up per-movie state so the next download starts fresh
+                idlix.reset_download_state()
+
                 # Auto-hide after 5 seconds
                 self.root.after(5000, self._hide_status_bar)
 
@@ -1471,6 +1678,8 @@ class IdlixGUI:
                     pass
             self.ffplay_process = None
             self.ytdlp_process = None
+            # Reset per-movie state so next movie starts fresh
+            self.idlix.reset_download_state()
             self._hide_status_bar()
         elif self.ffplay_process:
             self.root.after(2000, self._check_ffplay_status)
@@ -1490,6 +1699,8 @@ class IdlixGUI:
                 pass
         self.ffplay_process = None
         self.ytdlp_process = None
+        # Reset per-movie state so next movie starts fresh
+        self.idlix.reset_download_state()
         self._hide_status_bar()
 
     def open_download_folder(self):
